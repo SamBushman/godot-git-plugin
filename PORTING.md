@@ -118,6 +118,69 @@ editor `.app` itself does).
   `otool -L` list above) rather than statically — matches how CMake
   resolved them by default; not attempted to force static.
 
+## API compatibility with the actual engine (not just the SConstruct/CMake side)
+
+Upstream `v1.x`'s own README says it "works only for Godot 3.2.x-3.4.x" -
+godot-ports is 3.6.1, and that gap turned out to be real, not just a
+version-number formality. Found and fixed while getting a real project's
+Version Control dock to actually show anything:
+
+- **`_get_modified_files_data()` returned the wrong type entirely.**
+  `v1.x` returns a flat `Dictionary {file_path: status}`. The actual
+  engine (`editor/editor_vcs_interface.cpp`) expects an `Array` of
+  `{file_path, change_type, area}` dictionaries — `area` splits files into
+  staged/unstaged, a concept `v1.x`'s shape can't express at all. Passing
+  the wrong Variant type here doesn't error, it just silently returns
+  nothing to the dock — looked exactly like a stale-UI/cache bug (a
+  refresh button click changed nothing) before the real cause was found.
+- **`_get_current_branch_name` existed but was never registered** — the
+  engine calls it directly (`call("_get_current_branch_name")`) for the
+  branch label in the dock; it needs `register_method()` like every other
+  endpoint, not just to exist as a C++ method.
+- **`_get_diff`, `_discard_file`, and branch management
+  (`_get_branch_list`/`_create_branch`/`_remove_branch`/`_checkout_branch`)
+  didn't exist at all** in `v1.x` — the engine calls `_get_diff(identifier,
+  area)` for the diff viewer; `v1.x` only had an old, differently-named
+  `_get_file_diff(path)` that nothing calls anymore. Backported all of
+  these from `v2.x`, same translation approach as the remote-ops backport
+  (rewritten in this file's plain style, not v2.x's RAII wrappers).
+- **`_get_diff`'s STAGED case needed a different libgit2 call than v2.x
+  uses**, because of an architecture difference already baked into this
+  plugin: `_stage_file()`/`_unstage_file()` only touch an in-memory
+  `staged_files` list, not git's real index (only `_commit()` touches the
+  real index, at commit time). `v2.x`'s `_get_diff` diffs `HEAD` against
+  the *real* index (`git_diff_tree_to_index`) for the STAGED area, which
+  is always empty under this plugin's staging model - it correctly ran,
+  just always returned 0 hunks. Fixed by diffing `HEAD` directly against
+  on-disk content instead (`git_diff_tree_to_workdir`), which matches what
+  "staged" actually means here: whatever's in `staged_files` will be
+  committed using its *current* on-disk content, there's no separate
+  frozen index snapshot to diff against.
+
+**Real, confirmed big-endian bug, found live (not theoretical):**
+`EditorVCSInterface`'s inherited `create_status_file()`/`create_diff_file()`/
+`create_diff_hunk()`/`create_diff_line()`/`create_commit()` convenience
+methods are meant to build the exact Dictionary shapes the engine expects
+without the plugin needing to hand-roll key names. On this platform they're
+broken for any integer field: godot-cpp's generated icall
+(`___godot_icall_Dictionary_String_int_int` etc., in
+`godot-cpp/include/gen/__icalls.hpp`) packs int arguments as `int64_t` (8
+bytes) across the GDNative ptrcall boundary, but the engine's real C++
+signature takes a narrower native enum (`ChangeType`/`TreeArea`, likely 4
+bytes). Confirmed with a debug print bracketing the call: passing
+`area=2` in, getting a Dictionary with `area=0` back, every time. On
+little-endian platforms, reading a narrower type from the front of a wider
+one still gets the right low-order bytes; on big-endian PPC it reads the
+high-order bytes instead, which are zero for any small value - silently
+truncating `1`/`2`/etc. to `0`. This would be invisible on every mainstream
+(little-endian) platform this plugin has ever run on. **Fix: don't call
+any of the inherited `create_*()` helpers — build every Dictionary by hand
+instead** (same field names, just assigned directly with plain `dict["key"]
+= value`, which never crosses that ptrcall boundary). Done for all of
+`_get_modified_files_data()`/`_parse_diff()`; if `_get_previous_commits()`
+or `_get_line_diff()` are ever added, do the same there rather than calling
+`create_commit()`/`create_diff_line()` from a shared helper.
+
 ## Installing into a project
 
 Copy `demo/addons/godot-git-plugin/` into `res://addons/godot-git-plugin/`
@@ -166,6 +229,13 @@ not specific to this port.
   git-smart-HTTP protocol + pack download/indexing path end to end on
   real big-endian PPC hardware. Output showed real object counts and
   correctly created remote-tracking refs, no errors.
+- Status/diff/discard/branches, tested against a real project (correct
+  staged/unstaged split: 1 staged + 28 unstaged out of 29 real files;
+  correct diff content and line numbers for a staged file) and a
+  disposable throwaway repo for the destructive ops (`_discard_file`
+  confirmed to actually revert on-disk content and status; `_create_branch`
+  / `_checkout_branch` / `_remove_branch` all confirmed via real
+  `git branch`/`git status` state, not just the plugin's own report).
 - **Not yet verified live**: `_push` and `_pull`'s merge path, and
   `_set_credentials`. These need a real authenticated remote (a PAT
   token or SSH key), which wasn't available to test with in the session

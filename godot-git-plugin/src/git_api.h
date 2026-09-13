@@ -37,7 +37,7 @@ class GitAPI : public EditorVCSInterface {
 
 	void _commit(const String p_msg);
 	bool _is_vcs_initialized();
-	Dictionary _get_modified_files_data();
+	Array _get_modified_files_data();
 	Array _get_file_diff(const String file_path);
 	String _get_project_name();
 	String _get_vcs_name();
@@ -56,6 +56,15 @@ class GitAPI : public EditorVCSInterface {
 	void _push(const String remote, const bool force);
 
 	String _get_current_branch_name();
+
+	// Diff / discard / branch management.
+	Array _get_diff(const String identifier, const int64_t area);
+	Array _parse_diff(git_diff *p_diff);
+	void _discard_file(const String file_path);
+	Array _get_branch_list();
+	void _create_branch(const String branch_name);
+	void _remove_branch(const String branch_name);
+	bool _checkout_branch(const String branch_name);
 
 public:
 	static void _register_methods();

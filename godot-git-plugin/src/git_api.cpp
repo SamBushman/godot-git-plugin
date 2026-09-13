@@ -25,6 +25,14 @@ void GitAPI::_register_methods() {
 	register_method("_fetch", &GitAPI::_fetch);
 	register_method("_pull", &GitAPI::_pull);
 	register_method("_push", &GitAPI::_push);
+	register_method("_get_current_branch_name", &GitAPI::_get_current_branch_name);
+
+	register_method("_get_diff", &GitAPI::_get_diff);
+	register_method("_discard_file", &GitAPI::_discard_file);
+	register_method("_get_branch_list", &GitAPI::_get_branch_list);
+	register_method("_create_branch", &GitAPI::_create_branch);
+	register_method("_remove_branch", &GitAPI::_remove_branch);
+	register_method("_checkout_branch", &GitAPI::_checkout_branch);
 }
 
 void GitAPI::_commit(const String p_msg) {
@@ -172,7 +180,7 @@ bool GitAPI::_is_vcs_initialized() {
 	return is_initialized;
 }
 
-Dictionary GitAPI::_get_modified_files_data() {
+Array GitAPI::_get_modified_files_data() {
 	git_status_options opts = GIT_STATUS_OPTIONS_INIT;
 	opts.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
 	opts.flags = GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
@@ -181,7 +189,12 @@ Dictionary GitAPI::_get_modified_files_data() {
 	git_status_list *statuses = NULL;
 	GIT2_CALL(git_status_list_new(&statuses, repo, &opts), "Could not get status information from repository", NULL);
 
-	Dictionary diff; // Schema is <file_path, status>
+	// EditorVCSInterface::get_modified_files_data() (editor/editor_vcs_interface.cpp)
+	// expects an Array of {file_path, change_type, area} Dictionaries, not a flat
+	// map - "area" (TREE_AREA_STAGED=1 / TREE_AREA_UNSTAGED=2) comes from this
+	// plugin's own in-memory staged_files list, matching how _commit() decides
+	// what to actually write to the index (not git's own index state directly).
+	Array diff;
 	size_t count = git_status_list_entrycount(statuses);
 	for (size_t i = 0; i < count; ++i) {
 		const git_status_entry *entry = git_status_byindex(statuses, i);
@@ -191,28 +204,48 @@ Dictionary GitAPI::_get_modified_files_data() {
 		} else {
 			path = entry->head_to_index->new_file.path;
 		}
+
+		int change_type = -1;
 		switch (entry->status) {
 			case GIT_STATUS_INDEX_NEW:
 			case GIT_STATUS_WT_NEW: {
-				diff[path] = 0;
+				change_type = 0;
 			} break;
 			case GIT_STATUS_INDEX_MODIFIED:
 			case GIT_STATUS_WT_MODIFIED: {
-				diff[path] = 1;
+				change_type = 1;
 			} break;
 			case GIT_STATUS_INDEX_RENAMED:
 			case GIT_STATUS_WT_RENAMED: {
-				diff[path] = 2;
+				change_type = 2;
 			} break;
 			case GIT_STATUS_INDEX_DELETED:
 			case GIT_STATUS_WT_DELETED: {
-				diff[path] = 3;
+				change_type = 3;
 			} break;
 			case GIT_STATUS_INDEX_TYPECHANGE:
 			case GIT_STATUS_WT_TYPECHANGE: {
-				diff[path] = 4;
+				change_type = 4;
 			} break;
 		}
+		if (change_type == -1) {
+			continue;
+		}
+
+		int64_t area = (staged_files.find(path) != -1) ? 1 : 2; // TREE_AREA_STAGED : TREE_AREA_UNSTAGED
+
+		// NOT create_status_file(): EditorVCSInterface's inherited create_*
+		// helpers marshal int args as int64_t across the GDNative ptrcall
+		// boundary, but the engine's real C++ signature takes a narrower
+		// native enum - on big-endian PPC this truncates small values
+		// (e.g. area=1/2) to 0. Confirmed live: the value going in is
+		// correct, the Dictionary coming back always has area=0. Build the
+		// dictionary directly instead - same keys, no cross-ABI round trip.
+		Dictionary sf;
+		sf["file_path"] = path;
+		sf["change_type"] = change_type;
+		sf["area"] = area;
+		diff.push_back(sf);
 	}
 
 	git_status_list_free(statuses);
@@ -519,6 +552,284 @@ void GitAPI::_push(const String remote, const bool force) {
 	git_remote_free(remote_object);
 
 	Godot::print("GitAPI: Push ended");
+}
+
+Array GitAPI::_parse_diff(git_diff *p_diff) {
+	Array diff_contents_out;
+	if (!p_diff) {
+		return diff_contents_out;
+	}
+
+	size_t num_deltas = git_diff_num_deltas(p_diff);
+	for (size_t i = 0; i < num_deltas; i++) {
+		const git_diff_delta *delta = git_diff_get_delta(p_diff, i);
+
+		git_patch *patch = nullptr;
+		if (git_patch_from_diff(&patch, p_diff, i) != 0 || !patch) {
+			check_git2_errors(-1, "Could not create patch from diff", NULL);
+			continue;
+		}
+
+		// Built directly (not via the inherited create_diff_*() helpers) -
+		// see the note in _get_modified_files_data() about int64_t args
+		// getting truncated to 0 on big-endian PPC across that ptrcall
+		// boundary; diff_hunk's 4 int fields would hit the same bug.
+		Dictionary diff_file;
+		diff_file["new_file"] = String(delta->new_file.path);
+		diff_file["old_file"] = String(delta->old_file.path);
+
+		Array diff_hunks;
+		size_t num_hunks = git_patch_num_hunks(patch);
+		for (size_t j = 0; j < num_hunks; j++) {
+			const git_diff_hunk *git_hunk = nullptr;
+			size_t line_count = 0;
+			if (git_patch_get_hunk(&git_hunk, &line_count, patch, j) != 0) {
+				continue;
+			}
+
+			Dictionary diff_hunk;
+			diff_hunk["old_start"] = (int64_t)git_hunk->old_start;
+			diff_hunk["new_start"] = (int64_t)git_hunk->new_start;
+			diff_hunk["old_lines"] = (int64_t)git_hunk->old_lines;
+			diff_hunk["new_lines"] = (int64_t)git_hunk->new_lines;
+
+			Array diff_lines;
+			for (size_t k = 0; k < line_count; k++) {
+				const git_diff_line *line = nullptr;
+				if (git_patch_get_line_in_hunk(&line, patch, j, k) != 0) {
+					continue;
+				}
+
+				char *content = new char[line->content_len + 1];
+				memcpy(content, line->content, line->content_len);
+				content[line->content_len] = '\0';
+
+				String origin_str;
+				origin_str += String::chr(line->origin);
+
+				Dictionary diff_line;
+				diff_line["new_line_no"] = (int64_t)line->new_lineno;
+				diff_line["old_line_no"] = (int64_t)line->old_lineno;
+				diff_line["content"] = String(content);
+				diff_line["status"] = origin_str;
+				diff_lines.push_back(diff_line);
+
+				delete[] content;
+			}
+
+			diff_hunk["diff_lines"] = diff_lines;
+			diff_hunks.push_back(diff_hunk);
+		}
+		diff_file["diff_hunks"] = diff_hunks;
+		diff_contents_out.push_back(diff_file);
+
+		git_patch_free(patch);
+	}
+	return diff_contents_out;
+}
+
+Array GitAPI::_get_diff(const String identifier, const int64_t area) {
+	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
+	Array empty;
+
+	opts.context_lines = 2;
+	opts.interhunk_lines = 0;
+	opts.flags = GIT_DIFF_RECURSE_UNTRACKED_DIRS | GIT_DIFF_DISABLE_PATHSPEC_MATCH | GIT_DIFF_INCLUDE_UNTRACKED | GIT_DIFF_SHOW_UNTRACKED_CONTENT | GIT_DIFF_INCLUDE_TYPECHANGE;
+
+	char *pathspec_str = identifier.alloc_c_string();
+	opts.pathspec.strings = &pathspec_str;
+	opts.pathspec.count = 1;
+
+	git_diff *diff = nullptr;
+	int err = 0;
+
+	switch (area) {
+		case 2: { // TREE_AREA_UNSTAGED
+			err = git_diff_index_to_workdir(&diff, repo, nullptr, &opts);
+		} break;
+		case 1: { // TREE_AREA_STAGED
+			git_object *obj = nullptr;
+			git_revparse_single(&obj, repo, "HEAD^{tree}"); // May legitimately fail (no HEAD yet); tree stays null.
+
+			git_tree *tree = nullptr;
+			if (obj) {
+				git_tree_lookup(&tree, repo, git_object_id(obj));
+			}
+
+			// Not git_diff_tree_to_index(): this plugin's "staged" concept
+			// (staged_files, see _stage_file/_commit) is purely in-memory -
+			// _stage_file() never touches git's real index, only _commit()
+			// does, at commit time. So "staged" here really means "HEAD vs.
+			// current on-disk content for this path", not HEAD vs. index.
+			err = git_diff_tree_to_workdir(&diff, repo, tree, &opts);
+
+			if (tree) {
+				git_tree_free(tree);
+			}
+			if (obj) {
+				git_object_free(obj);
+			}
+		} break;
+		case 0: { // TREE_AREA_COMMIT
+			opts.pathspec.strings = nullptr;
+			opts.pathspec.count = 0;
+
+			git_object *obj = nullptr;
+			if (git_revparse_single(&obj, repo, pathspec_str) != 0 || !obj) {
+				check_git2_errors(-1, "Could not get object at", identifier.alloc_c_string());
+				return empty;
+			}
+
+			git_commit *commit = nullptr;
+			if (git_commit_lookup(&commit, repo, git_object_id(obj)) != 0) {
+				check_git2_errors(-1, "Could not get commit", identifier.alloc_c_string());
+				git_object_free(obj);
+				return empty;
+			}
+			git_object_free(obj);
+
+			git_commit *parent = nullptr;
+			git_commit_parent(&parent, commit, 0); // May legitimately fail (root commit); parent stays null.
+
+			git_tree *commit_tree = nullptr;
+			git_tree *parent_tree = nullptr;
+			if (git_commit_tree(&commit_tree, commit) != 0) {
+				check_git2_errors(-1, "Could not get commit tree of", identifier.alloc_c_string());
+				git_commit_free(commit);
+				if (parent) {
+					git_commit_free(parent);
+				}
+				return empty;
+			}
+			if (parent) {
+				git_commit_tree(&parent_tree, parent);
+			}
+
+			err = git_diff_tree_to_tree(&diff, repo, parent_tree, commit_tree, &opts);
+
+			if (commit_tree) {
+				git_tree_free(commit_tree);
+			}
+			if (parent_tree) {
+				git_tree_free(parent_tree);
+			}
+			git_commit_free(commit);
+			if (parent) {
+				git_commit_free(parent);
+			}
+		} break;
+	}
+
+	if (err != 0) {
+		check_git2_errors(-1, "Could not generate diff for", identifier.alloc_c_string());
+		return empty;
+	}
+
+	Array result = _parse_diff(diff);
+	if (diff) {
+		git_diff_free(diff);
+	}
+	return result;
+}
+
+void GitAPI::_discard_file(const String file_path) {
+	git_checkout_options opts = GIT_CHECKOUT_OPTIONS_INIT;
+	char *path_str = file_path.alloc_c_string();
+	char *paths[] = { path_str };
+	opts.paths.strings = paths;
+	opts.paths.count = 1;
+	opts.checkout_strategy = GIT_CHECKOUT_FORCE;
+
+	GIT2_CALL(git_checkout_index(repo, nullptr, &opts), "Could not discard changes to", file_path.alloc_c_string());
+}
+
+Array GitAPI::_get_branch_list() {
+	git_branch_iterator *it = nullptr;
+	if (git_branch_iterator_new(&it, repo, GIT_BRANCH_LOCAL) != 0) {
+		check_git2_errors(-1, "Could not create branch iterator", NULL);
+		return Array();
+	}
+
+	Array branch_names;
+	git_reference *ref = nullptr;
+	git_branch_t type;
+	while (git_branch_next(&ref, &type, it) != GIT_ITEROVER) {
+		const char *name = nullptr;
+		if (git_branch_name(&name, ref) == 0) {
+			if (git_branch_is_head(ref)) {
+				branch_names.push_front(String(name));
+			} else {
+				branch_names.push_back(String(name));
+			}
+		}
+		git_reference_free(ref);
+		ref = nullptr;
+	}
+	git_branch_iterator_free(it);
+
+	return branch_names;
+}
+
+void GitAPI::_create_branch(const String branch_name) {
+	git_oid head_commit_id;
+	if (git_reference_name_to_id(&head_commit_id, repo, "HEAD") != 0) {
+		check_git2_errors(-1, "Could not get HEAD commit ID", NULL);
+		return;
+	}
+
+	git_commit *head_commit = nullptr;
+	if (git_commit_lookup(&head_commit, repo, &head_commit_id) != 0) {
+		check_git2_errors(-1, "Could not lookup HEAD commit", NULL);
+		return;
+	}
+
+	git_reference *branch_ref = nullptr;
+	GIT2_CALL(git_branch_create(&branch_ref, repo, branch_name.alloc_c_string(), head_commit, 0), "Could not create branch from HEAD", NULL);
+	if (branch_ref) {
+		git_reference_free(branch_ref);
+	}
+	git_commit_free(head_commit);
+}
+
+void GitAPI::_remove_branch(const String branch_name) {
+	git_reference *branch = nullptr;
+	if (git_branch_lookup(&branch, repo, branch_name.alloc_c_string(), GIT_BRANCH_LOCAL) != 0) {
+		check_git2_errors(-1, "Could not find branch", branch_name.alloc_c_string());
+		return;
+	}
+	GIT2_CALL(git_branch_delete(branch), "Could not delete branch reference of", branch_name.alloc_c_string());
+	git_reference_free(branch);
+}
+
+bool GitAPI::_checkout_branch(const String branch_name) {
+	git_reference *branch = nullptr;
+	if (git_branch_lookup(&branch, repo, branch_name.alloc_c_string(), GIT_BRANCH_LOCAL) != 0) {
+		check_git2_errors(-1, "Could not find branch", branch_name.alloc_c_string());
+		return false;
+	}
+	const char *branch_ref_name = git_reference_name(branch);
+
+	git_object *treeish = nullptr;
+	if (git_revparse_single(&treeish, repo, branch_name.alloc_c_string()) != 0) {
+		check_git2_errors(-1, "Could not find branch head", branch_name.alloc_c_string());
+		git_reference_free(branch);
+		return false;
+	}
+
+	git_checkout_options opts = GIT_CHECKOUT_OPTIONS_INIT;
+	opts.checkout_strategy = GIT_CHECKOUT_SAFE;
+	bool ok = true;
+	if (git_checkout_tree(repo, treeish, &opts) != 0) {
+		check_git2_errors(-1, "Could not checkout branch tree", branch_name.alloc_c_string());
+		ok = false;
+	} else if (git_repository_set_head(repo, branch_ref_name) != 0) {
+		check_git2_errors(-1, "Could not set head to", branch_name.alloc_c_string());
+		ok = false;
+	}
+
+	git_object_free(treeish);
+	git_reference_free(branch);
+	return ok;
 }
 
 void GitAPI::_init() {
