@@ -258,10 +258,16 @@ not specific to this port.
   came back in a non-monotonic order. Fixed by adding
   `GIT_SORT_TOPOLOGICAL` as a tiebreaker, which still respects
   parent-before-child so newest-first stays correct.
-- **Not yet verified live**: `_push` and `_pull`'s merge path, and
-  `_set_credentials`. These need a real authenticated remote (a PAT
-  token or SSH key), which wasn't available to test with in the session
-  that built this — the underlying mechanism (`credentials_cb`) is a
-  straightforward, well-understood libgit2 pattern with nothing
-  Tiger-specific about it, but treat this as the one remaining
-  real-world gap until someone tries it against a repo they can push to.
+- **`_push` + `_set_credentials`, confirmed live (2026-09-13) against a
+  real private GitHub repo** using HTTPS + a Personal Access Token,
+  entered through the Version Control dock's own Set Up Version Control
+  dialog — real commits appeared on github.com immediately after,
+  independently confirmed via the GitHub API. This closes out the last
+  gap noted in earlier verification passes; every method this plugin
+  implements has now been exercised against a real remote/real project,
+  not just a synthetic local test.
+- `_pull`'s merge path (as opposed to plain `_fetch`, already verified)
+  is still not separately confirmed — low risk given it shares the same
+  `credentials_cb`/`git_remote_connect` path as the now-verified `_push`,
+  but the actual fast-forward/merge logic in `_pull` hasn't been
+  exercised against real divergent history yet.
