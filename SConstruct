@@ -13,6 +13,8 @@ opts.Add(EnumVariable('p', "Compilation target, alias for 'platform'", '', ['', 
 opts.Add(BoolVariable('use_llvm', "Use the LLVM / Clang compiler", 'no'))
 opts.Add(PathVariable('target_path', 'The path where the lib is installed.', 'demo/addons/godot-git-plugin/'))
 opts.Add(PathVariable('target_name', 'The library name.', 'libgitapi', PathVariable.PathAccept))
+opts.Add(EnumVariable('arch', "Target architecture override (osx only; used for the ppc/Tiger port)", '', ['', 'ppc']))
+opts.Add(PathVariable('macos_sdk_path', 'macOS SDK path (osx arch=ppc only)', '', PathVariable.PathAccept))
 
 # Local dependency paths, adapt them to your setup
 godot_headers_path = "godot-cpp/godot-headers/"
@@ -44,7 +46,19 @@ if env['platform'] == "osx":
     env['target_path'] += 'osx/'
     cpp_library += '.osx'
     libgit2_lib_path += 'osx/'
-    if env['target'] in ('debug', 'd'):
+    if env['arch'] == 'ppc':
+        # Tiger/Leopard PPC: single-arch build via Tigerbrew's gcc-7 (no Clang on this OS).
+        env['CC'] = ARGUMENTS.get('cc', 'gcc-7')
+        env['CXX'] = ARGUMENTS.get('cxx', 'g++-7')
+        ppc_flags = ['-arch', 'ppc', '-std=c++14', '-mmacosx-version-min=10.4', '-B/usr/local/opt/ld64/bin/']
+        if env['macos_sdk_path']:
+            ppc_flags += ['-isysroot', env['macos_sdk_path']]
+        if env['target'] in ('debug', 'd'):
+            env.Append(CCFLAGS = ['-g', '-O2'] + ppc_flags)
+        else:
+            env.Append(CCFLAGS = ['-g', '-O3'] + ppc_flags)
+        env.Append(LINKFLAGS = ppc_flags)
+    elif env['target'] in ('debug', 'd'):
         env.Append(CCFLAGS = ['-g','-O2', '-arch', 'x86_64', '-arch', 'arm64', '-std=c++17'])
         env.Append(LINKFLAGS = ['-arch', 'x86_64', '-arch', 'arm64'])
     else:
@@ -82,7 +96,9 @@ else:
     cpp_library += '.release'
     env['target_path'] += 'release/'
 
-if env['platform'] == 'osx':
+if env['platform'] == 'osx' and env['arch'] == 'ppc':
+    cpp_library += '.ppc'
+elif env['platform'] == 'osx':
     cpp_library += '.universal'
 else:
     cpp_library += '.' + str(bits)
