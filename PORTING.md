@@ -310,3 +310,19 @@ CoreDrag SSH-interaction limitation (the window's OpenGL surface isn't
 reliably painted to the visible framebuffer when launched this way),
 not a flaw in the feature — but it's worth a 30-second look at the
 physical machine to be sure the colors actually show up as designed.
+
+**Follow-up, same day** ([PR #59](https://github.com/SamBushman/godot-ports/pull/59),
+also merged): the user caught a real gap in #58 by asking a precise
+question rather than assuming — editing a script and saving the *scene*
+(not the script itself) writes the file to disk correctly via Godot's
+own "flush any modified-but-unsaved open resource" scene-save behavior,
+but that path never touched the marker-refresh hook, so the colors
+silently went stale. Auditing every other script write/reload path
+found a second gap the same way: the "file changed externally, reload?"
+dialog (and the debugger's own script-reload trigger) also never
+refreshed markers. Both fixed at their lowest common points — the
+actual `ResourceSaver::save()` save-callback (fires for literally every
+save in the editor) rather than patching each UI action's call site
+individually. This time verified with a temporary debug print
+confirming the exact call chain fires, not just static review — see
+that PR's description for the full test.
