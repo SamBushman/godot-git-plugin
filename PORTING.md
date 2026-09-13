@@ -72,11 +72,36 @@ same way the godot-ports editor `.app` itself does).
 ## Installing into a project
 
 Copy `demo/addons/godot-git-plugin/` into `res://addons/godot-git-plugin/`
-in your project, then enable it the normal way (Project Settings > Plugins).
-`EditorVCSInterface`-derived classes can only be instantiated by the actual
-editor (`Engine.is_editor_hint()`), not from an exported game or `-s` script
-mode — that's an upstream Godot restriction on every platform, not specific
-to this port.
+in your project.
+
+**Do not** try to enable it via Project Settings > Plugins — that will fail
+with "Base type is not EditorPlugin". That tab is only for addons whose
+`plugin.cfg` `script=` points at an `EditorPlugin`; this addon's
+`git_api.gdns` is an `EditorVCSInterface`, a different, VCS-specific
+extension point with its own discovery mechanism (`editor_node.cpp` hard-
+requires `EditorPlugin` for anything toggled from that tab — stock Godot
+behavior on every platform, not a port issue). Leave it absent/disabled in
+that list.
+
+Instead:
+
+1. Just having the files under `res://addons/godot-git-plugin/` is enough —
+   `git_api.gdns` declares `script_class_name = "GitAPI"`, which Godot's
+   filesystem scanner auto-registers as a global class as soon as it sees
+   the file (no manual `project.godot` editing needed). Reopening the
+   project forces a rescan if it doesn't show up immediately.
+2. Open **Project menu > Version Control > Set Up Version Control**. Its
+   dropdown lists every auto-discovered class whose base is
+   `EditorVCSInterface` (see `fetch_available_vcs_plugin_names()` in
+   `editor/plugins/version_control_editor_plugin.cpp`) — "GitAPI" should be
+   there. Select it and confirm.
+3. The Version Control dock and the rest of the Project > Version Control
+   submenu (stage, commit, diff, branches) light up after that.
+
+Also note: `EditorVCSInterface`-derived classes can only be instantiated by
+the actual editor (`Engine.is_editor_hint()`), not from an exported game or
+`-s` script mode — another upstream Godot restriction on every platform,
+not specific to this port.
 
 ## Verified working (2026-09-12, on a G4 running Tiger 10.4.11)
 
