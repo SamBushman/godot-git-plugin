@@ -58,6 +58,11 @@ if env['platform'] == "osx":
         else:
             env.Append(CCFLAGS = ['-g', '-O3'] + ppc_flags)
         env.Append(LINKFLAGS = ppc_flags)
+        # SSH/HTTPS transports: Tigerbrew's openssl3 + libssh2 (both keg-only,
+        # not on default search paths).
+        env.Append(CPPPATH = ['/usr/local/opt/openssl3/include', '/usr/local/opt/libssh2/include'])
+        env.Append(LIBPATH = ['/usr/local/opt/openssl3/lib', '/usr/local/opt/libssh2/lib'])
+        env.Append(LIBS = ['ssh2', 'ssl', 'crypto'])
     elif env['target'] in ('debug', 'd'):
         env.Append(CCFLAGS = ['-g','-O2', '-arch', 'x86_64', '-arch', 'arm64', '-std=c++17'])
         env.Append(LINKFLAGS = ['-arch', 'x86_64', '-arch', 'arm64'])

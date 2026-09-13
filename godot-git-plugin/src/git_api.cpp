@@ -17,6 +17,14 @@ void GitAPI::_register_methods() {
 	register_method("_shut_down", &GitAPI::_shut_down);
 	register_method("_stage_file", &GitAPI::_stage_file);
 	register_method("_unstage_file", &GitAPI::_unstage_file);
+
+	register_method("_set_credentials", &GitAPI::_set_credentials);
+	register_method("_get_remotes", &GitAPI::_get_remotes);
+	register_method("_create_remote", &GitAPI::_create_remote);
+	register_method("_remove_remote", &GitAPI::_remove_remote);
+	register_method("_fetch", &GitAPI::_fetch);
+	register_method("_pull", &GitAPI::_pull);
+	register_method("_push", &GitAPI::_push);
 }
 
 void GitAPI::_commit(const String p_msg) {
@@ -277,6 +285,240 @@ bool GitAPI::_shut_down() {
 	GIT2_CALL(git_libgit2_shutdown(), "Could not shutdown Git Addon", NULL);
 
 	return true;
+}
+
+String GitAPI::_get_current_branch_name() {
+	git_reference *head = nullptr;
+	if (git_repository_head(&head, repo) != 0) {
+		return String();
+	}
+	String name = git_reference_shorthand(head);
+	git_reference_free(head);
+	return name;
+}
+
+void GitAPI::_set_credentials(const String username, const String password, const String ssh_public_key_path, const String ssh_private_key_path, const String ssh_passphrase) {
+	creds.username = username;
+	creds.password = password;
+	creds.ssh_public_key_path = ssh_public_key_path;
+	creds.ssh_private_key_path = ssh_private_key_path;
+	creds.ssh_passphrase = ssh_passphrase;
+}
+
+Array GitAPI::_get_remotes() {
+	git_strarray remote_names = { NULL, 0 };
+	GIT2_CALL(git_remote_list(&remote_names, repo), "Could not get list of remotes", NULL);
+
+	Array remotes;
+	for (size_t i = 0; i < remote_names.count; i++) {
+		remotes.push_back(String(remote_names.strings[i]));
+	}
+	git_strarray_free(&remote_names);
+
+	return remotes;
+}
+
+void GitAPI::_create_remote(const String remote_name, const String remote_url) {
+	git_remote *remote = nullptr;
+	GIT2_CALL(git_remote_create(&remote, repo, remote_name.alloc_c_string(), remote_url.alloc_c_string()), "Could not create remote", NULL);
+	if (remote) {
+		git_remote_free(remote);
+	}
+}
+
+void GitAPI::_remove_remote(const String remote_name) {
+	GIT2_CALL(git_remote_delete(repo, remote_name.alloc_c_string()), "Could not delete remote", remote_name.alloc_c_string());
+}
+
+static void _fill_remote_callbacks(git_remote_callbacks &remote_cbs, Credentials *creds) {
+	remote_cbs = GIT_REMOTE_CALLBACKS_INIT;
+	remote_cbs.credentials = &credentials_cb;
+	remote_cbs.update_tips = &update_cb;
+	remote_cbs.sideband_progress = &progress_cb;
+	remote_cbs.transfer_progress = &transfer_progress_cb;
+	remote_cbs.payload = creds;
+	remote_cbs.push_transfer_progress = &push_transfer_progress_cb;
+	remote_cbs.push_update_reference = &push_update_reference_cb;
+}
+
+void GitAPI::_fetch(const String remote) {
+	Godot::print("GitAPI: Performing fetch from " + remote);
+
+	git_remote *remote_object = nullptr;
+	if (git_remote_lookup(&remote_object, repo, remote.alloc_c_string()) != 0) {
+		check_git2_errors(-1, "Could not lookup remote", remote.alloc_c_string());
+		return;
+	}
+
+	git_remote_callbacks remote_cbs;
+	_fill_remote_callbacks(remote_cbs, &creds);
+
+	if (git_remote_connect(remote_object, GIT_DIRECTION_FETCH, &remote_cbs, nullptr, nullptr) != 0) {
+		check_git2_errors(-1, "Could not connect to remote (check your credentials)", remote.alloc_c_string());
+		git_remote_free(remote_object);
+		return;
+	}
+
+	git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
+	opts.callbacks = remote_cbs;
+	GIT2_CALL(git_remote_fetch(remote_object, nullptr, &opts, "fetch"), "Could not fetch data from remote", NULL);
+
+	git_remote_free(remote_object);
+
+	Godot::print("GitAPI: Fetch ended");
+}
+
+void GitAPI::_pull(const String remote) {
+	Godot::print("GitAPI: Performing pull from " + remote);
+
+	git_remote *remote_object = nullptr;
+	if (git_remote_lookup(&remote_object, repo, remote.alloc_c_string()) != 0) {
+		check_git2_errors(-1, "Could not lookup remote", remote.alloc_c_string());
+		return;
+	}
+
+	git_remote_callbacks remote_cbs;
+	_fill_remote_callbacks(remote_cbs, &creds);
+
+	if (git_remote_connect(remote_object, GIT_DIRECTION_FETCH, &remote_cbs, nullptr, nullptr) != 0) {
+		check_git2_errors(-1, "Could not connect to remote (check your credentials)", remote.alloc_c_string());
+		git_remote_free(remote_object);
+		return;
+	}
+
+	git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
+	fetch_opts.callbacks = remote_cbs;
+
+	String branch_name = _get_current_branch_name();
+	char *ref_spec_str = String("refs/heads/" + branch_name).alloc_c_string();
+	char *ref[] = { ref_spec_str };
+	git_strarray refspec = { ref, 1 };
+
+	int fetch_err = git_remote_fetch(remote_object, &refspec, &fetch_opts, "pull");
+	git_remote_free(remote_object);
+	if (fetch_err != 0) {
+		check_git2_errors(-1, "Could not fetch data from remote", NULL);
+		return;
+	}
+
+	pull_merge_oid = {};
+	GIT2_CALL(git_repository_fetchhead_foreach(repo, fetchhead_foreach_cb, &pull_merge_oid), "Could not read \"FETCH_HEAD\" file", NULL);
+
+	if (git_oid_is_zero(&pull_merge_oid)) {
+		Godot::print_error("GitAPI: Could not find remote branch HEAD for " + branch_name + ". Try pushing the branch first.", __func__, __FILE__, __LINE__);
+		return;
+	}
+
+	git_annotated_commit *fetchhead_annotated_commit = nullptr;
+	if (git_annotated_commit_lookup(&fetchhead_annotated_commit, repo, &pull_merge_oid) != 0) {
+		check_git2_errors(-1, "Could not get merge commit", NULL);
+		return;
+	}
+
+	const git_annotated_commit *merge_heads[] = { fetchhead_annotated_commit };
+
+	git_merge_analysis_t merge_analysis;
+	git_merge_preference_t preference = GIT_MERGE_PREFERENCE_NONE;
+	int analysis_err = git_merge_analysis(&merge_analysis, &preference, repo, merge_heads, 1);
+	if (analysis_err != 0) {
+		check_git2_errors(-1, "Merge analysis failed", NULL);
+		git_annotated_commit_free(fetchhead_annotated_commit);
+		return;
+	}
+
+	if (merge_analysis & GIT_MERGE_ANALYSIS_FASTFORWARD) {
+		git_checkout_options ff_checkout_options = GIT_CHECKOUT_OPTIONS_INIT;
+		ff_checkout_options.checkout_strategy = GIT_CHECKOUT_SAFE;
+
+		git_reference *target_ref = nullptr;
+		GIT2_CALL(git_repository_head(&target_ref, repo), "Failed to get HEAD reference", NULL);
+
+		git_object *target = nullptr;
+		GIT2_CALL(git_object_lookup(&target, repo, &pull_merge_oid, GIT_OBJECT_COMMIT), "Failed to lookup fetched commit", NULL);
+
+		if (target) {
+			GIT2_CALL(git_checkout_tree(repo, target, &ff_checkout_options), "Failed to checkout HEAD reference", NULL);
+			git_object_free(target);
+		}
+
+		if (target_ref) {
+			git_reference *new_target_ref = nullptr;
+			GIT2_CALL(git_reference_set_target(&new_target_ref, target_ref, &pull_merge_oid, nullptr), "Failed to move HEAD reference", NULL);
+			if (new_target_ref) {
+				git_reference_free(new_target_ref);
+			}
+			git_reference_free(target_ref);
+		}
+
+		Godot::print("GitAPI: Fast Forwarded");
+		GIT2_CALL(git_repository_state_cleanup(repo), "Could not clean repository state", NULL);
+
+	} else if (merge_analysis & GIT_MERGE_ANALYSIS_NORMAL) {
+		git_merge_options merge_opts = GIT_MERGE_OPTIONS_INIT;
+		git_checkout_options checkout_opts = GIT_CHECKOUT_OPTIONS_INIT;
+
+		merge_opts.file_favor = GIT_MERGE_FILE_FAVOR_NORMAL;
+		merge_opts.file_flags = (GIT_MERGE_FILE_STYLE_DIFF3 | GIT_MERGE_FILE_DIFF_MINIMAL);
+		checkout_opts.checkout_strategy = (GIT_CHECKOUT_SAFE | GIT_CHECKOUT_ALLOW_CONFLICTS | GIT_CHECKOUT_CONFLICT_STYLE_MERGE);
+		GIT2_CALL(git_merge(repo, merge_heads, 1, &merge_opts, &checkout_opts), "Merge Failed", NULL);
+
+		git_index *index = nullptr;
+		GIT2_CALL(git_repository_index(&index, repo), "Could not get repository index", NULL);
+
+		if (index && git_index_has_conflicts(index)) {
+			Godot::print_error("GitAPI: Index has conflicts. Solve conflicts and make a merge commit.", __func__, __FILE__, __LINE__);
+		} else {
+			Godot::print("GitAPI: Changes are staged, make a merge commit.");
+		}
+		if (index) {
+			git_index_free(index);
+		}
+
+		has_merge = true;
+
+	} else if (merge_analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE) {
+		Godot::print("GitAPI: Already up to date");
+		GIT2_CALL(git_repository_state_cleanup(repo), "Could not clean repository state", NULL);
+
+	} else {
+		Godot::print("GitAPI: Can not merge");
+	}
+
+	git_annotated_commit_free(fetchhead_annotated_commit);
+
+	Godot::print("GitAPI: Pull ended");
+}
+
+void GitAPI::_push(const String remote, const bool force) {
+	Godot::print("GitAPI: Performing push to " + remote);
+
+	git_remote *remote_object = nullptr;
+	if (git_remote_lookup(&remote_object, repo, remote.alloc_c_string()) != 0) {
+		check_git2_errors(-1, "Could not lookup remote", remote.alloc_c_string());
+		return;
+	}
+
+	git_remote_callbacks remote_cbs;
+	_fill_remote_callbacks(remote_cbs, &creds);
+
+	if (git_remote_connect(remote_object, GIT_DIRECTION_PUSH, &remote_cbs, nullptr, nullptr) != 0) {
+		check_git2_errors(-1, "Could not connect to remote (check your credentials)", remote.alloc_c_string());
+		git_remote_free(remote_object);
+		return;
+	}
+
+	String branch_name = _get_current_branch_name();
+	char *pushspec_str = (String() + (force ? "+" : "") + "refs/heads/" + branch_name).alloc_c_string();
+	git_strarray refspec = { &pushspec_str, 1 };
+
+	git_push_options push_options = GIT_PUSH_OPTIONS_INIT;
+	push_options.callbacks = remote_cbs;
+
+	GIT2_CALL(git_remote_push(remote_object, &refspec, &push_options), "Failed to push", NULL);
+
+	git_remote_free(remote_object);
+
+	Godot::print("GitAPI: Push ended");
 }
 
 void GitAPI::_init() {

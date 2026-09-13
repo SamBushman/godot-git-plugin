@@ -18,10 +18,23 @@ use with [SamBushman/godot-ports](https://github.com/SamBushman/godot-ports).
   (Tiger/Leopard PPC Godot is a 32-bit build; Godot's GDNativeLibrary loader
   matches `OS.<bits>` via `OS::has_feature()`, and `sizeof(void*)==4` reports
   feature `"32"`, not `"64"`).
-- SSH/HTTPS remote transports are disabled in libgit2, matching upstream's
-  own `build_libs_mac.sh` — this plugin never implements push/pull/fetch/
-  clone on any platform (Godot's VCS panel is local-only: status, diff,
-  stage, commit, branches), so this costs nothing here.
+- SSH/HTTPS remote transports (push/pull/fetch/remote management) are
+  **enabled**, backported from the `v2.x` plugin line (which added them;
+  upstream `v1.x` never had them). Uses Tigerbrew's `openssl3` and
+  `libssh2` packages — both already have real prebuilt PPC Tiger bottles
+  (or build from source cleanly; `openssl3` did on this machine, no
+  altivec bottle existed for the exact version). See the "Remote
+  operations" section below for the exact build flags and a real gotcha
+  found along the way (`htonll` doesn't exist on Tiger).
+- `_push`/`_pull`/`_fetch`/`_create_remote`/`_remove_remote`/`_get_remotes`/
+  `_set_credentials` were written fresh in this codebase's existing plain
+  raw-pointer style (not copied verbatim from `v2.x`, which uses a much
+  more elaborate RAII-wrapper architecture) — same libgit2 API calls,
+  adapted to match the rest of this file. One real upstream bug was
+  caught and fixed while doing this: `v2.x`'s `push_update_reference_cb`
+  has the success/rejection check backwards (per libgit2's own doc
+  comment, `status` is non-NULL only on *rejection* — `v2.x` treats
+  non-NULL as success).
 
 ## Build recipe (native, on the Tiger/Leopard machine itself)
 
@@ -32,7 +45,12 @@ Prerequisites (all via [Tigerbrew](https://github.com/mistydemeo/tigerbrew)):
 export PATH="/usr/local/opt/ld64/bin:/usr/local/bin:$PATH"
 SDK=/Developer/SDKs/MacOSX10.4u.sdk   # or the 10.5 SDK on Leopard
 
-# 1. libgit2 (vendored source, static lib, no SSH/HTTPS/iconv)
+# 1. libgit2 (vendored source, static lib, SSH via libssh2 + HTTPS via OpenSSL)
+#    Both openssl3 and libssh2 come from Tigerbrew; both are keg-only so
+#    their pkgconfig/lib dirs aren't on the default search path.
+brew install openssl3 libssh2   # already present if Tigerbrew's own git is installed
+export PKG_CONFIG_PATH="/usr/local/opt/openssl3/lib/pkgconfig:/usr/local/opt/libssh2/lib/pkgconfig:/usr/local/opt/zlib/lib/pkgconfig"
+
 cd godot-git-plugin/thirdparty/libgit2
 mkdir build && cd build
 cmake .. -DCMAKE_C_COMPILER=gcc-7 \
@@ -40,7 +58,11 @@ cmake .. -DCMAKE_C_COMPILER=gcc-7 \
   -DCMAKE_C_FLAGS="-mmacosx-version-min=10.4" \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
   -DBUILD_CLAR=OFF -DBUILD_EXAMPLES=OFF \
-  -DUSE_SSH=OFF -DUSE_HTTPS=OFF -DUSE_BUNDLED_ZLIB=ON -DUSE_ICONV=OFF \
+  -DUSE_SSH=ON -DUSE_HTTPS=OpenSSL \
+  -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl3 \
+  -DCMAKE_PREFIX_PATH="/usr/local/opt/openssl3;/usr/local/opt/libssh2" \
+  -DUSE_NTLMCLIENT=OFF \
+  -DUSE_BUNDLED_ZLIB=ON -DUSE_ICONV=OFF \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 cd ../../../..
@@ -65,9 +87,36 @@ python3 -m SCons platform=osx arch=ppc target=release \
 ```
 
 Output: `demo/addons/godot-git-plugin/osx/release/libgitapi.dylib` (ppc,
-depends on Tigerbrew's `libstdc++.6.dylib`/`libgcc_s.1.dylib` — bundle these
-alongside if distributing outside a machine with Tigerbrew installed, the
-same way the godot-ports editor `.app` itself does).
+depends on Tigerbrew's `libstdc++.6.dylib`/`libgcc_s.1.dylib`/`libssh2.1.dylib`/
+`libssl.3.dylib`/`libcrypto.3.dylib` — bundle these alongside if distributing
+outside a machine with Tigerbrew installed, the same way the godot-ports
+editor `.app` itself does).
+
+## Remote operations (SSH/HTTPS) — gotchas found while building this
+
+- **`CMAKE_PREFIX_PATH` is required, not just `PKG_CONFIG_PATH`.**
+  `libssh2.pc`'s `Requires.private` on `libssl`/`libcrypto` isn't resolved
+  through pkg-config alone by libgit2's own `FIND_PKGLIBRARIES` CMake
+  macro — without `CMAKE_PREFIX_PATH` pointing at both kegs, it silently
+  resolves to Tiger's ancient stock `/usr/lib/libssl.dylib` (0.9.7l,
+  pre-TLS-1.2) instead of Tigerbrew's. Confirmed both ways by inspecting
+  CMake's own "Resolved libraries:" configure-log line.
+- **Same silent-wrong-library trap for `find_package(OpenSSL)` directly**
+  — without `-DOPENSSL_ROOT_DIR=/usr/local/opt/openssl3`, it finds the
+  same ancient stock OpenSSL. Always pass both `OPENSSL_ROOT_DIR` and
+  `CMAKE_PREFIX_PATH`.
+- **`htonll` doesn't exist on Tiger.** libgit2's NTLM auth module
+  (`USE_NTLMCLIENT`, on by default on Unix) uses it and fails to link
+  ("Undefined symbols: _htonll"). Not needed for GitHub (HTTPS token or
+  SSH key auth, not NTLM) — just pass `-DUSE_NTLMCLIENT=OFF`.
+- Credentials go through libgit2's `git_credential_*` callback (plain
+  username+password for HTTPS — e.g. a GitHub PAT as the password — or an
+  SSH key file path + passphrase). No ssh-agent or OS keychain dependency;
+  the values come straight from `EditorVCSInterface::set_credentials()`,
+  which the editor's Version Control dock already has a dialog for.
+- The `.dylib` picks up OpenSSL/libssh2 as dynamic dependencies (see the
+  `otool -L` list above) rather than statically — matches how CMake
+  resolved them by default; not attempted to force static.
 
 ## Installing into a project
 
@@ -103,9 +152,24 @@ the actual editor (`Engine.is_editor_hint()`), not from an exported game or
 `-s` script mode — another upstream Godot restriction on every platform,
 not specific to this port.
 
-## Verified working (2026-09-12, on a G4 running Tiger 10.4.11)
+## Verified working (2026-09-12/13, on a G4 running Tiger 10.4.11)
 
-`_get_vcs_name`, `_initialize`, `_is_vcs_initialized`, `_get_modified_files_data`,
-`_stage_file`, `_commit` all exercised live inside the real editor against a
-real on-disk git repo; commits created by the plugin were confirmed
-independently via `git log` on the same repo.
+- Local operations: `_get_vcs_name`, `_initialize`, `_is_vcs_initialized`,
+  `_get_modified_files_data`, `_stage_file`, `_commit` all exercised live
+  inside the real editor against a real on-disk git repo; commits created
+  by the plugin were confirmed independently via `git log` on the same
+  repo.
+- Remote operations: `_create_remote`, `_get_remotes`, `_remove_remote`,
+  and a real `_fetch` against a live public GitHub repo
+  (`octocat/Hello-World`) over HTTPS — no credentials needed for a public
+  repo, so this genuinely exercises the full TLS handshake +
+  git-smart-HTTP protocol + pack download/indexing path end to end on
+  real big-endian PPC hardware. Output showed real object counts and
+  correctly created remote-tracking refs, no errors.
+- **Not yet verified live**: `_push` and `_pull`'s merge path, and
+  `_set_credentials`. These need a real authenticated remote (a PAT
+  token or SSH key), which wasn't available to test with in the session
+  that built this — the underlying mechanism (`credentials_cb`) is a
+  straightforward, well-understood libgit2 pattern with nothing
+  Tiger-specific about it, but treat this as the one remaining
+  real-world gap until someone tries it against a repo they can push to.

@@ -31,6 +31,10 @@ class GitAPI : public EditorVCSInterface {
 
 	git_repository *repo = nullptr;
 
+	Credentials creds;
+	bool has_merge = false;
+	git_oid pull_merge_oid = {};
+
 	void _commit(const String p_msg);
 	bool _is_vcs_initialized();
 	Dictionary _get_modified_files_data();
@@ -41,6 +45,17 @@ class GitAPI : public EditorVCSInterface {
 	bool _shut_down();
 	void _stage_file(const String p_file_path);
 	void _unstage_file(const String p_file_path);
+
+	// Remote operations.
+	void _set_credentials(const String username, const String password, const String ssh_public_key_path, const String ssh_private_key_path, const String ssh_passphrase);
+	Array _get_remotes();
+	void _create_remote(const String remote_name, const String remote_url);
+	void _remove_remote(const String remote_name);
+	void _fetch(const String remote);
+	void _pull(const String remote);
+	void _push(const String remote, const bool force);
+
+	String _get_current_branch_name();
 
 public:
 	static void _register_methods();
