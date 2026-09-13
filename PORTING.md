@@ -186,7 +186,7 @@ drives the Commit List panel) and `_get_line_diff` (checked where the
 engine actually calls it — nowhere in this codebase; it's declared on the
 interface but no UI code invokes it in this build, so it's not a real gap,
 just unimplemented API surface with nothing on the other end. See
-[issue tracking a diff-viewer feature that would use it](https://github.com/SamBushman/godot-git-plugin/issues) —
+[issue #1](https://github.com/SamBushman/godot-git-plugin/issues/1) tracking a diff-viewer feature that would use it —
 until that lands, implementing `_get_line_diff` itself would be dead
 code). Also confirmed `_is_vcs_initialized`/`_get_project_name`/
 `_get_file_diff` (still present in this plugin, inherited from `v1.x`)
