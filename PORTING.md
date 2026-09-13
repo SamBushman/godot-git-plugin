@@ -182,13 +182,11 @@ instead** (same field names, just assigned directly with plain `dict["key"]
 **Full interface audit (2026-09-13):** cross-checked every `BIND_VMETHOD`
 in `editor/editor_vcs_interface.cpp` (21 total) against what this plugin
 registers. Two were missing: `_get_previous_commits` (now implemented,
-drives the Commit List panel) and `_get_line_diff` (checked where the
-engine actually calls it — nowhere in this codebase; it's declared on the
-interface but no UI code invokes it in this build, so it's not a real gap,
-just unimplemented API surface with nothing on the other end. See
-[issue #1](https://github.com/SamBushman/godot-git-plugin/issues/1) tracking a diff-viewer feature that would use it —
-until that lands, implementing `_get_line_diff` itself would be dead
-code). Also confirmed `_is_vcs_initialized`/`_get_project_name`/
+drives the Commit List panel) and `_get_line_diff`, **now also
+implemented** — see "Line diff / script editor markers" below.
+[Issue #1](https://github.com/SamBushman/godot-git-plugin/issues/1)
+tracked this; closed once both the plugin method and its
+godot-ports-side consumer landed. Also confirmed `_is_vcs_initialized`/`_get_project_name`/
 `_get_file_diff` (still present in this plugin, inherited from `v1.x`)
 aren't part of the current 21-method interface at all — harmless dead
 code, not gaps.
@@ -271,3 +269,44 @@ not specific to this port.
   `credentials_cb`/`git_remote_connect` path as the now-verified `_push`,
   but the actual fast-forward/merge logic in `_pull` hasn't been
   exercised against real divergent history yet.
+- `_get_line_diff` (see "Line diff / script editor markers" below):
+  verified the full data pipeline live against a real 2-commit-apart
+  test repo (one modified line, one newly added line) — returned exactly
+  the expected hunks (a hunk with both a deletion and an addition for the
+  modified line, a separate pure-addition hunk for the new line), correct
+  line numbers, correct content. The godot-ports consumer
+  (`ScriptTextEditor::update_vcs_status_markers()`) ran to completion
+  with no errors when exercised via the real editor's
+  `EditorInterface.edit_script()` path. **Not independently confirmed
+  visually** — see the note below.
+
+## Line diff / script editor markers
+
+`_get_line_diff(file_path, text)` diffs `text` (the editor's current,
+possibly-unsaved buffer) against the file's last-committed (HEAD) blob
+directly, via libgit2's `git_patch_from_blob_and_buffer` — no synthetic
+tree/workdir diff needed, this is exactly what that function is for. A
+null old-blob (new, never-committed file) is handled automatically by
+libgit2 as "diff against an empty file," correctly marking every line
+added. Shares the same big-endian-safe manual-Dictionary hunk-building
+helper as `_get_diff` (refactored into `_build_hunks_array()`).
+
+This backs a companion feature in
+[SamBushman/godot-ports](https://github.com/SamBushman/godot-ports)
+(PR [#58](https://github.com/SamBushman/godot-ports/pull/58), merged
+into `Tiger_GL1_2_FF`): colored line numbers in the script editor
+(green=added, orange=modified), refreshed on save and when a script is
+first opened. No reference implementation existed anywhere upstream to
+build this against — checked every Godot version including current
+4.x; it's a long-standing unimplemented feature request
+(godotengine/godot-proposals#1089, open since 2020). Full design
+writeup is in that PR's commit message. One thing worth flagging for
+whoever picks this up next: the actual rendered colors were not
+independently confirmed visually this session — a screenshot of the
+SSH-launched test instance came back with a correctly-titled but blank
+window content area. The process itself ran correctly throughout (see
+above), so this looks like a rendering-specific cousin of the known
+CoreDrag SSH-interaction limitation (the window's OpenGL surface isn't
+reliably painted to the visible framebuffer when launched this way),
+not a flaw in the feature — but it's worth a 30-second look at the
+physical machine to be sure the colors actually show up as designed.

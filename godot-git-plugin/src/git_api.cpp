@@ -34,6 +34,7 @@ void GitAPI::_register_methods() {
 	register_method("_remove_branch", &GitAPI::_remove_branch);
 	register_method("_checkout_branch", &GitAPI::_checkout_branch);
 	register_method("_get_previous_commits", &GitAPI::_get_previous_commits);
+	register_method("_get_line_diff", &GitAPI::_get_line_diff);
 }
 
 void GitAPI::_commit(const String p_msg) {
@@ -555,6 +556,61 @@ void GitAPI::_push(const String remote, const bool force) {
 	Godot::print("GitAPI: Push ended");
 }
 
+// Shared by _parse_diff() (whole-file diffs) and _get_line_diff() (a single
+// blob-vs-buffer patch). Built directly (not via the inherited
+// create_diff_*() helpers) - see the note in _get_modified_files_data()
+// about int64_t args getting truncated to 0 on big-endian PPC across that
+// ptrcall boundary; diff_hunk's 4 int fields would hit the same bug.
+static Array _build_hunks_array(git_patch *patch) {
+	Array diff_hunks;
+	if (!patch) {
+		return diff_hunks;
+	}
+
+	size_t num_hunks = git_patch_num_hunks(patch);
+	for (size_t j = 0; j < num_hunks; j++) {
+		const git_diff_hunk *git_hunk = nullptr;
+		size_t line_count = 0;
+		if (git_patch_get_hunk(&git_hunk, &line_count, patch, j) != 0) {
+			continue;
+		}
+
+		Dictionary diff_hunk;
+		diff_hunk["old_start"] = (int64_t)git_hunk->old_start;
+		diff_hunk["new_start"] = (int64_t)git_hunk->new_start;
+		diff_hunk["old_lines"] = (int64_t)git_hunk->old_lines;
+		diff_hunk["new_lines"] = (int64_t)git_hunk->new_lines;
+
+		Array diff_lines;
+		for (size_t k = 0; k < line_count; k++) {
+			const git_diff_line *line = nullptr;
+			if (git_patch_get_line_in_hunk(&line, patch, j, k) != 0) {
+				continue;
+			}
+
+			char *content = new char[line->content_len + 1];
+			memcpy(content, line->content, line->content_len);
+			content[line->content_len] = '\0';
+
+			String origin_str;
+			origin_str += String::chr(line->origin);
+
+			Dictionary diff_line;
+			diff_line["new_line_no"] = (int64_t)line->new_lineno;
+			diff_line["old_line_no"] = (int64_t)line->old_lineno;
+			diff_line["content"] = String(content);
+			diff_line["status"] = origin_str;
+			diff_lines.push_back(diff_line);
+
+			delete[] content;
+		}
+
+		diff_hunk["diff_lines"] = diff_lines;
+		diff_hunks.push_back(diff_hunk);
+	}
+	return diff_hunks;
+}
+
 Array GitAPI::_parse_diff(git_diff *p_diff) {
 	Array diff_contents_out;
 	if (!p_diff) {
@@ -571,57 +627,10 @@ Array GitAPI::_parse_diff(git_diff *p_diff) {
 			continue;
 		}
 
-		// Built directly (not via the inherited create_diff_*() helpers) -
-		// see the note in _get_modified_files_data() about int64_t args
-		// getting truncated to 0 on big-endian PPC across that ptrcall
-		// boundary; diff_hunk's 4 int fields would hit the same bug.
 		Dictionary diff_file;
 		diff_file["new_file"] = String(delta->new_file.path);
 		diff_file["old_file"] = String(delta->old_file.path);
-
-		Array diff_hunks;
-		size_t num_hunks = git_patch_num_hunks(patch);
-		for (size_t j = 0; j < num_hunks; j++) {
-			const git_diff_hunk *git_hunk = nullptr;
-			size_t line_count = 0;
-			if (git_patch_get_hunk(&git_hunk, &line_count, patch, j) != 0) {
-				continue;
-			}
-
-			Dictionary diff_hunk;
-			diff_hunk["old_start"] = (int64_t)git_hunk->old_start;
-			diff_hunk["new_start"] = (int64_t)git_hunk->new_start;
-			diff_hunk["old_lines"] = (int64_t)git_hunk->old_lines;
-			diff_hunk["new_lines"] = (int64_t)git_hunk->new_lines;
-
-			Array diff_lines;
-			for (size_t k = 0; k < line_count; k++) {
-				const git_diff_line *line = nullptr;
-				if (git_patch_get_line_in_hunk(&line, patch, j, k) != 0) {
-					continue;
-				}
-
-				char *content = new char[line->content_len + 1];
-				memcpy(content, line->content, line->content_len);
-				content[line->content_len] = '\0';
-
-				String origin_str;
-				origin_str += String::chr(line->origin);
-
-				Dictionary diff_line;
-				diff_line["new_line_no"] = (int64_t)line->new_lineno;
-				diff_line["old_line_no"] = (int64_t)line->old_lineno;
-				diff_line["content"] = String(content);
-				diff_line["status"] = origin_str;
-				diff_lines.push_back(diff_line);
-
-				delete[] content;
-			}
-
-			diff_hunk["diff_lines"] = diff_lines;
-			diff_hunks.push_back(diff_hunk);
-		}
-		diff_file["diff_hunks"] = diff_hunks;
+		diff_file["diff_hunks"] = _build_hunks_array(patch);
 		diff_contents_out.push_back(diff_file);
 
 		git_patch_free(patch);
@@ -883,6 +892,56 @@ Array GitAPI::_get_previous_commits(const int64_t max_commits) {
 
 	git_revwalk_free(walker);
 	return commits;
+}
+
+Array GitAPI::_get_line_diff(const String file_path, const String text) {
+	// Diffs `text` (the editor's current, possibly-unsaved buffer content)
+	// against the file's last-committed (HEAD) version - not the on-disk
+	// or index version. This backs the script editor's per-line VCS status
+	// markers (see godot-ports' ScriptTextEditor::update_vcs_status_markers).
+	git_object *head_tree_obj = nullptr;
+	git_revparse_single(&head_tree_obj, repo, "HEAD^{tree}"); // May legitimately fail (no HEAD yet).
+
+	git_tree *head_tree = nullptr;
+	if (head_tree_obj) {
+		git_tree_lookup(&head_tree, repo, git_object_id(head_tree_obj));
+		git_object_free(head_tree_obj);
+	}
+
+	git_blob *old_blob = nullptr;
+	if (head_tree) {
+		git_tree_entry *entry = nullptr;
+		if (git_tree_entry_bypath(&entry, head_tree, file_path.alloc_c_string()) == 0) {
+			git_blob_lookup(&old_blob, repo, git_tree_entry_id(entry));
+			git_tree_entry_free(entry);
+		}
+		// GIT_ENOTFOUND (file didn't exist in HEAD - a new file) is not an
+		// error here: old_blob just stays null, and git_patch_from_blob_
+		// and_buffer treats a null old_blob as "diff against an empty
+		// file", correctly marking every line as added.
+		git_tree_free(head_tree);
+	}
+
+	CharString text_utf8 = text.utf8();
+
+	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
+	opts.context_lines = 0; // Only need to know which lines changed, not surrounding context.
+
+	git_patch *patch = nullptr;
+	int err = git_patch_from_blob_and_buffer(&patch, old_blob, file_path.alloc_c_string(), text_utf8.get_data(), text_utf8.length(), file_path.alloc_c_string(), &opts);
+
+	if (old_blob) {
+		git_blob_free(old_blob);
+	}
+
+	if (err != 0 || !patch) {
+		check_git2_errors(-1, "Could not create line diff for", file_path.alloc_c_string());
+		return Array();
+	}
+
+	Array hunks = _build_hunks_array(patch);
+	git_patch_free(patch);
+	return hunks;
 }
 
 void GitAPI::_init() {

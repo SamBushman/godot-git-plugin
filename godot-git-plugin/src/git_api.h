@@ -60,6 +60,7 @@ class GitAPI : public EditorVCSInterface {
 	// Diff / discard / branch management.
 	Array _get_diff(const String identifier, const int64_t area);
 	Array _parse_diff(git_diff *p_diff);
+	Array _get_line_diff(const String file_path, const String text);
 	void _discard_file(const String file_path);
 	Array _get_branch_list();
 	void _create_branch(const String branch_name);
