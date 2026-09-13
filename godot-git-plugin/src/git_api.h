@@ -65,6 +65,7 @@ class GitAPI : public EditorVCSInterface {
 	void _create_branch(const String branch_name);
 	void _remove_branch(const String branch_name);
 	bool _checkout_branch(const String branch_name);
+	Array _get_previous_commits(const int64_t max_commits);
 
 public:
 	static void _register_methods();

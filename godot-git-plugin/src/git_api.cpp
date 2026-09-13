@@ -33,6 +33,7 @@ void GitAPI::_register_methods() {
 	register_method("_create_branch", &GitAPI::_create_branch);
 	register_method("_remove_branch", &GitAPI::_remove_branch);
 	register_method("_checkout_branch", &GitAPI::_checkout_branch);
+	register_method("_get_previous_commits", &GitAPI::_get_previous_commits);
 }
 
 void GitAPI::_commit(const String p_msg) {
@@ -830,6 +831,58 @@ bool GitAPI::_checkout_branch(const String branch_name) {
 	git_object_free(treeish);
 	git_reference_free(branch);
 	return ok;
+}
+
+Array GitAPI::_get_previous_commits(const int64_t max_commits) {
+	git_revwalk *walker = nullptr;
+	if (git_revwalk_new(&walker, repo) != 0) {
+		check_git2_errors(-1, "Could not create new revwalk", NULL);
+		return Array();
+	}
+	// GIT_SORT_TOPOLOGICAL as a tiebreaker: plain GIT_SORT_TIME has no way
+	// to order commits made within the same second (real timestamps only
+	// have 1s resolution), which showed up immediately in testing with a
+	// few rapid-fire commits. Topological order still respects
+	// parent-before-child, so newest-first stays correct either way.
+	git_revwalk_sorting(walker, GIT_SORT_TIME | GIT_SORT_TOPOLOGICAL);
+
+	// Ignore failure here: an empty/unborn-HEAD repo has nothing to walk,
+	// which isn't an error - it just means the commit list stays empty.
+	git_revwalk_push_head(walker);
+
+	Array commits;
+	git_oid oid;
+	char commit_id[GIT_OID_HEXSZ + 1];
+	for (int64_t i = 0; i < max_commits && git_revwalk_next(&oid, walker) == 0; i++) {
+		git_commit *commit = nullptr;
+		if (git_commit_lookup(&commit, repo, &oid) != 0) {
+			check_git2_errors(-1, "Failed to lookup the commit", NULL);
+			break;
+		}
+
+		git_oid_tostr(commit_id, sizeof(commit_id), git_commit_id(commit));
+		String msg = git_commit_message(commit);
+
+		const git_signature *sig = git_commit_author(commit);
+		String author = String(sig->name) + " <" + String(sig->email) + ">";
+
+		// Built directly, not via create_commit() - see the note in
+		// _get_modified_files_data() about int fields getting truncated to
+		// 0 on big-endian PPC across that call boundary; unix_timestamp/
+		// offset_minutes here would hit the same bug.
+		Dictionary commit_info;
+		commit_info["message"] = msg;
+		commit_info["author"] = author;
+		commit_info["unix_timestamp"] = (int64_t)sig->when.time;
+		commit_info["offset_minutes"] = (int64_t)sig->when.offset;
+		commit_info["id"] = String(commit_id);
+		commits.push_back(commit_info);
+
+		git_commit_free(commit);
+	}
+
+	git_revwalk_free(walker);
+	return commits;
 }
 
 void GitAPI::_init() {

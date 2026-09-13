@@ -177,9 +177,21 @@ truncating `1`/`2`/etc. to `0`. This would be invisible on every mainstream
 any of the inherited `create_*()` helpers — build every Dictionary by hand
 instead** (same field names, just assigned directly with plain `dict["key"]
 = value`, which never crosses that ptrcall boundary). Done for all of
-`_get_modified_files_data()`/`_parse_diff()`; if `_get_previous_commits()`
-or `_get_line_diff()` are ever added, do the same there rather than calling
-`create_commit()`/`create_diff_line()` from a shared helper.
+`_get_modified_files_data()`/`_parse_diff()`/`_get_previous_commits()`.
+
+**Full interface audit (2026-09-13):** cross-checked every `BIND_VMETHOD`
+in `editor/editor_vcs_interface.cpp` (21 total) against what this plugin
+registers. Two were missing: `_get_previous_commits` (now implemented,
+drives the Commit List panel) and `_get_line_diff` (checked where the
+engine actually calls it — nowhere in this codebase; it's declared on the
+interface but no UI code invokes it in this build, so it's not a real gap,
+just unimplemented API surface with nothing on the other end. See
+[issue tracking a diff-viewer feature that would use it](https://github.com/SamBushman/godot-git-plugin/issues) —
+until that lands, implementing `_get_line_diff` itself would be dead
+code). Also confirmed `_is_vcs_initialized`/`_get_project_name`/
+`_get_file_diff` (still present in this plugin, inherited from `v1.x`)
+aren't part of the current 21-method interface at all — harmless dead
+code, not gaps.
 
 ## Installing into a project
 
@@ -236,6 +248,16 @@ not specific to this port.
   confirmed to actually revert on-disk content and status; `_create_branch`
   / `_checkout_branch` / `_remove_branch` all confirmed via real
   `git branch`/`git status` state, not just the plugin's own report).
+- `_get_previous_commits` (the Commit List panel), tested against a
+  disposable repo with 3 real commits — correct author/message/id/
+  timestamp for all three (confirming the big-endian-safe manual
+  Dictionary construction works here too). One real bug caught in
+  testing, not just in review: plain `GIT_SORT_TIME` has no way to order
+  commits made within the same second (git's commit timestamps only have
+  1s resolution) — three commits made back-to-back in the test script
+  came back in a non-monotonic order. Fixed by adding
+  `GIT_SORT_TOPOLOGICAL` as a tiebreaker, which still respects
+  parent-before-child so newest-first stays correct.
 - **Not yet verified live**: `_push` and `_pull`'s merge path, and
   `_set_credentials`. These need a real authenticated remote (a PAT
   token or SSH key), which wasn't available to test with in the session
